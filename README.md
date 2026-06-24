@@ -35,8 +35,9 @@ opencode-direnv automatically detects and loads `.envrc` files, ensuring your Op
 ### Key Features
 
 - **Automatic Detection** — Searches for `.envrc` from the project directory up to the git root
+- **Live Reloading** — Re-applies the devshell when `.envrc`/`flake.nix`/`flake.lock` change or the session goes idle, and *removes* variables that are dropped
 - **Seamless Integration** — Applies environment variables to `process.env` for all subsequent commands
-- **Smart Notifications** — Toast alerts for blocked `.envrc` files and successful environment loads
+- **Smart Notifications** — Toast alerts for blocked `.envrc` files, successful loads, and reloads
 - **Zero Configuration** — Works out of the box with sensible defaults
 - **Graceful Degradation** — Silently skips if direnv is not installed or no `.envrc` exists
 
@@ -150,6 +151,7 @@ use asdf
 2. **Directory Traversal** — Searches upward from project directory, stopping at git root
 3. **Environment Export** — Executes `direnv export json` for structured output
 4. **Variable Application** — Merges exported variables into `process.env`
+5. **Live Reload** — When `.envrc`/`flake.nix`/`flake.lock` are edited (debounced), the environment is re-exported and reconciled. Variables removed from the devshell are removed from `process.env`. A slow `use flake` re-evaluation runs in the background and never blocks the session.
 
 ---
 
@@ -158,8 +160,9 @@ use asdf
 | Type | Condition | Message |
 |------|-----------|---------|
 | Warning | `.envrc` is blocked | Prompts user to run `direnv allow` |
-| Info | Environment loaded | Confirms successful environment application |
-| *Silent* | No direnv or `.envrc` | No notification displayed |
+| Info | Environment loaded | Confirms initial environment application |
+| Info | Environment reloaded | Shows added/changed/removed counts (e.g. `direnv: reloaded (+2 ~1)`) |
+| *Silent* | No change, no direnv or `.envrc` | No notification displayed |
 
 ---
 
@@ -167,9 +170,9 @@ use asdf
 
 | Limitation | Description | Workaround |
 |------------|-------------|------------|
-| Single Load | Environment loaded once per session | Start new session for `.envrc` changes |
+| Debounced Reload | Reloads are debounced (~1.5s after a file edit) | The agent can run `direnv reload` itself if it needs an immediate refresh |
 | Manual Allow | `.envrc` must be explicitly allowed | Run `direnv allow` (security feature) |
-| No Unload | Variables persist until session ends | Sessions are isolated by design |
+| Flake Latency | A changed `use flake` re-evaluates on reload | Reloads run in the background; the session is never blocked |
 
 ---
 
