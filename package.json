@@ -1,10 +1,13 @@
 {
-  "name": "@simonwjackson/opencode-direnv",
+  "name": "opencode2-direnv",
   "version": "0.0.0-development",
-  "description": "OpenCode plugin that automatically loads direnv environment variables at session start",
+  "description": "OpenCode 2 plugin that automatically loads direnv environment variables",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "exports": {
+    ".": "./dist/index.js"
+  },
   "files": [
     "dist",
     "src"
@@ -14,27 +17,28 @@
   },
   "keywords": [
     "opencode",
+    "opencode2",
     "direnv",
     "plugin",
     "nix",
     "environment",
     "env"
   ],
-  "author": "simonwjackson",
+  "author": "ankarhem",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/simonwjackson/opencode-direnv.git"
+    "url": "git+https://github.com/ankarhem/opencode-direnv.git"
   },
   "bugs": {
-    "url": "https://github.com/simonwjackson/opencode-direnv/issues"
+    "url": "https://github.com/ankarhem/opencode-direnv/issues"
   },
-  "homepage": "https://github.com/simonwjackson/opencode-direnv#readme",
+  "homepage": "https://github.com/ankarhem/opencode-direnv#readme",
   "peerDependencies": {
-    "@opencode-ai/plugin": ">=1.0.0"
+    "@opencode-ai/plugin": "beta"
   },
   "devDependencies": {
-    "@opencode-ai/plugin": "^1.0.147",
+    "@opencode-ai/plugin": "^0.0.0-beta-19086",
     "@types/node": "^22.0.0",
     "typescript": "^5.9.3"
   }
