@@ -1,6 +1,6 @@
 {
   "name": "opencode2-direnv",
-  "version": "0.0.0-development",
+  "version": "2026.0904.0",
   "description": "OpenCode 2 plugin that automatically loads direnv environment variables",
   "type": "module",
   "main": "dist/index.js",
@@ -10,7 +10,8 @@
   },
   "files": [
     "dist",
-    "src"
+    "src",
+    "index.ts"
   ],
   "scripts": {
     "build": "tsc"
