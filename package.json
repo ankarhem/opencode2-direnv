@@ -29,12 +29,12 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/ankarhem/opencode-direnv.git"
+    "url": "git+https://github.com/ankarhem/opencode2-direnv.git"
   },
   "bugs": {
-    "url": "https://github.com/ankarhem/opencode-direnv/issues"
+    "url": "https://github.com/ankarhem/opencode2-direnv/issues"
   },
-  "homepage": "https://github.com/ankarhem/opencode-direnv#readme",
+  "homepage": "https://github.com/ankarhem/opencode2-direnv#readme",
   "peerDependencies": {
     "@opencode-ai/plugin": "beta"
   },
