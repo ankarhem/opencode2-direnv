@@ -21,6 +21,22 @@ import { promisify } from "node:util"
  *   *removes* dropped keys so removed variables don't linger
  * - Logs outcomes with a `direnv:` prefix (blocked .envrc is always reported)
  * - Silently skips if direnv is not installed or .envrc is missing
+ *
+ * Environment hygiene (self-healing):
+ *
+ * `nix print-dev-env` exports a `shellHook` variable whose value is the raw
+ * shell *script* of the devShell hook, typically ending with a line like
+ * `export PATH=/nix/store/…:$PATH`. OpenCode 2 parses that text naively and
+ * can end up with a bogus env entry literally named `export PATH`, and a PATH
+ * value containing a literal `$PATH` breaks every spawned subprocess (local
+ * MCP servers die with `MCP error -32000: Connection closed`). Once PATH is
+ * corrupted, `execFile("direnv")` fails with ENOENT, so without the repair
+ * below the devShell environment can never load again — a permanent breakage
+ * loop.
+ *
+ * Therefore, on every load: strip the poison, repair PATH before invoking
+ * direnv, resolve direnv by absolute path as a fallback, and never apply
+ * variables that are env-name-invalid or whose value is a shell script.
  */
 
 const run = promisify(execFile)
@@ -55,6 +71,102 @@ const RELEVANT_FILES = new Set([".envrc", "flake.nix", "flake.lock"])
 
 /** debounce window for background reloads (ms) */
 const RELOAD_DEBOUNCE_MS = 1500
+
+/** variables whose values are shell scripts, not environment data */
+const SCRIPT_VARS = new Set(["shellHook", "buildPhase", "phases", "prePhases", "postPhases"])
+
+/** known-broken env entries to remove from process.env */
+const POISON_VARS = ["shellHook", ...SCRIPT_VARS, "export PATH"]
+
+/** valid POSIX environment variable names */
+const VALID_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/
+
+/** fallback PATHs used when repairing a corrupted PATH */
+const sanePath = () => {
+  const parts: string[] = []
+  if (process.env.HOST_PATH) parts.push(process.env.HOST_PATH)
+  if (process.env.HOME) parts.push(`${process.env.HOME}/.nix-profile/bin`)
+  if (process.env.USER) parts.push(`/etc/profiles/per-user/${process.env.USER}/bin`)
+  parts.push(
+    "/nix/var/nix/profiles/default/bin",
+    "/run/current-system/sw/bin",
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+    "/usr/bin:/bin:/usr/sbin:/sbin",
+  )
+  return parts.join(":")
+}
+
+/** candidate locations for direnv, absolute paths first so that a PATH
+ * corruption after setup cannot break the cached resolution */
+const direnvCandidates = () =>
+  [
+    `/etc/profiles/per-user/${process.env.USER ?? ""}/bin/direnv`,
+    `${process.env.HOME ?? ""}/.nix-profile/bin/direnv`,
+    "/run/current-system/sw/bin/direnv",
+    "/opt/homebrew/bin/direnv",
+    "/usr/local/bin/direnv",
+  ]
+    .filter((candidate) => !candidate.includes("//"))
+    .concat("direnv")
+
+/** Strip known poison from process.env; returns the removed keys. */
+const stripPoison = (): string[] => {
+  const removed: string[] = []
+  for (const key of POISON_VARS) {
+    if (key in process.env) {
+      delete process.env[key]
+      removed.push(key)
+    }
+  }
+  return removed
+}
+
+/**
+ * Repair process.env.PATH if it is corrupted (contains a literal `$`),
+ * returning the usable PATH. A corrupted PATH otherwise makes direnv (and
+ * every other subprocess this plugin could help) unlaunchable.
+ */
+const repairPath = (): string => {
+  const current = process.env.PATH
+  if (current && !current.includes("$")) return current
+  const fallback = sanePath()
+  process.env.PATH = fallback
+  console.warn(`direnv: repaired corrupted PATH (was ${JSON.stringify(current)})`)
+  return fallback
+}
+
+/** Resolve direnv once; prefers absolute locations, falls back to PATH. */
+let direnvPath: string | null | undefined
+const findDirenv = async (): Promise<string | null> => {
+  if (direnvPath !== undefined) return direnvPath
+  for (const candidate of direnvCandidates()) {
+    try {
+      await run(candidate, ["version"], { encoding: "utf8" })
+      direnvPath = candidate
+      return direnvPath
+    } catch {
+      // try next candidate
+    }
+  }
+  direnvPath = null
+  return direnvPath
+}
+
+/**
+ * Strip poison and repair PATH. Runs before every direnv invocation so a
+ * daemon that gets corrupted mid-flight heals itself on the next reload.
+ * Returns true if anything was repaired.
+ */
+const sanitize = (): boolean => {
+  const stripped = stripPoison()
+  if (stripped.length > 0) {
+    console.warn(`direnv: stripped poison vars from process.env: ${stripped.join(", ")}`)
+  }
+  const before = process.env.PATH
+  repairPath()
+  return stripped.length > 0 || process.env.PATH !== before
+}
 
 const runText = async (file: string, args: string[], cwd: string) => {
   const { stdout } = await run(file, args, {
@@ -148,7 +260,7 @@ export default Plugin.define({
       if (envrcPath) {
         envrcDir = dirname(envrcPath)
       }
-      discovered = envrcDir !== null
+      discovered = envrcPath !== null
       return envrcDir
     }
 
@@ -174,15 +286,25 @@ export default Plugin.define({
       reloading = true
 
       try {
+        // Self-heal before touching direnv: a corrupted PATH would make the
+        // direnv lookup below fail with ENOENT forever.
+        sanitize()
+
         const dir = await resolveEnvrcDir()
         if (!dir) {
           outcome.unavailable = true
           return outcome
         }
 
+        const direnv = await findDirenv()
+        if (!direnv) {
+          outcome.unavailable = true
+          return outcome
+        }
+
         let jsonText: string
         try {
-          jsonText = await runText("direnv", ["export", "json"], dir)
+          jsonText = await runText(direnv, ["export", "json"], dir)
         } catch (error: unknown) {
           const stderr =
             error && typeof error === "object" && "stderr" in error
@@ -211,9 +333,13 @@ export default Plugin.define({
         }
 
         // 2. Apply current vars, counting additions and value changes.
+        //    Skip invalid names (e.g. a phantom `export PATH` entry) and
+        //    script-valued vars (e.g. nix's `shellHook`) — they corrupt
+        //    subprocess environments instead of configuring them.
         const nextApplied = new Set<string>()
         for (const [key, value] of Object.entries(newVars)) {
           if (value == null) continue
+          if (!VALID_NAME.test(key) || SCRIPT_VARS.has(key)) continue
           const current = process.env[key]
           if (current === undefined) outcome.added++
           else if (current !== value) outcome.changed++
