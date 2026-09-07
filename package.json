@@ -14,7 +14,8 @@
     "index.ts"
   ],
   "scripts": {
-    "build": "tsc"
+    "build": "tsc",
+    "test": "node --import tsx --test \"test/**/*.test.ts\""
   },
   "keywords": [
     "opencode",
@@ -41,6 +42,7 @@
   "devDependencies": {
     "@opencode-ai/plugin": "^0.0.0-beta-19086",
     "@types/node": "^22.0.0",
+    "tsx": "^4.23.13",
     "typescript": "^5.9.3"
   }
 }

@@ -82,7 +82,7 @@ const POISON_VARS = ["shellHook", ...SCRIPT_VARS, "export PATH"]
 const VALID_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/
 
 /** fallback PATHs used when repairing a corrupted PATH */
-const sanePath = () => {
+export const sanePath = () => {
   const parts: string[] = []
   if (process.env.HOST_PATH) parts.push(process.env.HOST_PATH)
   if (process.env.HOME) parts.push(`${process.env.HOME}/.nix-profile/bin`)
@@ -99,7 +99,7 @@ const sanePath = () => {
 
 /** candidate locations for direnv, absolute paths first so that a PATH
  * corruption after setup cannot break the cached resolution */
-const direnvCandidates = () =>
+export const direnvCandidates = () =>
   [
     `/etc/profiles/per-user/${process.env.USER ?? ""}/bin/direnv`,
     `${process.env.HOME ?? ""}/.nix-profile/bin/direnv`,
@@ -111,7 +111,7 @@ const direnvCandidates = () =>
     .concat("direnv")
 
 /** Strip known poison from process.env; returns the removed keys. */
-const stripPoison = (): string[] => {
+export const stripPoison = (): string[] => {
   const removed: string[] = []
   for (const key of POISON_VARS) {
     if (key in process.env) {
@@ -123,11 +123,26 @@ const stripPoison = (): string[] => {
 }
 
 /**
+ * Filter a `direnv export json` payload down to variables that are safe to
+ * apply: valid POSIX names only (drops phantom entries like `export PATH`)
+ * and no script-valued vars (drops nix's `shellHook` and friends).
+ */
+export const filterVars = (vars: Record<string, string | null | undefined>): Record<string, string> => {
+  const safe: Record<string, string> = {}
+  for (const [key, value] of Object.entries(vars)) {
+    if (value == null) continue
+    if (!VALID_NAME.test(key) || SCRIPT_VARS.has(key)) continue
+    safe[key] = value
+  }
+  return safe
+}
+
+/**
  * Repair process.env.PATH if it is corrupted (contains a literal `$`),
  * returning the usable PATH. A corrupted PATH otherwise makes direnv (and
  * every other subprocess this plugin could help) unlaunchable.
  */
-const repairPath = (): string => {
+export const repairPath = (): string => {
   const current = process.env.PATH
   if (current && !current.includes("$")) return current
   const fallback = sanePath()
@@ -136,21 +151,45 @@ const repairPath = (): string => {
   return fallback
 }
 
-/** Resolve direnv once; prefers absolute locations, falls back to PATH. */
-let direnvPath: string | null | undefined
-const findDirenv = async (): Promise<string | null> => {
-  if (direnvPath !== undefined) return direnvPath
-  for (const candidate of direnvCandidates()) {
+/**
+ * Return the first direnv candidate that responds to `direnv version`, or
+ * null. Pure w.r.t. module state so it stays testable.
+ */
+export const probeDirenv = async (
+  candidates: string[],
+  exec: (file: string, args: string[]) => Promise<unknown> = (file, args) => run(file, args, { encoding: "utf8" })
+): Promise<string | null> => {
+  for (const candidate of candidates) {
     try {
-      await run(candidate, ["version"], { encoding: "utf8" })
-      direnvPath = candidate
-      return direnvPath
+      await exec(candidate, ["version"])
+      return candidate
     } catch {
       // try next candidate
     }
   }
-  direnvPath = null
+  return null
+}
+
+/** Resolve direnv once; prefers absolute locations, falls back to PATH. */
+let direnvPath: string | null | undefined
+const findDirenv = async (): Promise<string | null> => {
+  if (direnvPath !== undefined) return direnvPath
+  direnvPath = await probeDirenv(direnvCandidates())
   return direnvPath
+}
+
+/** Find the nearest .envrc at or above `start`, not looking past `stopAt`. */
+export const nearestEnvrc = (start: string, stopAt: string | null): string | null => {
+  let current = start
+  const boundary = stopAt || "/"
+  for (;;) {
+    const candidate = join(current, ".envrc")
+    if (existsSync(candidate)) return candidate
+    if (current === boundary || current === "/") return null
+    const parent = dirname(current)
+    if (parent === current) return null
+    current = parent
+  }
 }
 
 /**
@@ -224,29 +263,7 @@ export default Plugin.define({
     const findEnvrc = async (
       startDir: string,
       stopAt: string | null
-    ): Promise<string | null> => {
-      let current = startDir
-      const boundary = stopAt || "/"
-
-      while (true) {
-        if (existsSync(join(current, ".envrc"))) {
-          return join(current, ".envrc")
-        }
-
-        if (current === boundary || current === "/") {
-          break
-        }
-
-        const parent = dirname(current)
-        if (parent === current) {
-          break
-        }
-
-        current = parent
-      }
-
-      return null
-    }
+    ): Promise<string | null> => nearestEnvrc(startDir, stopAt)
 
     /**
      * Resolve (and cache) the directory containing .envrc.
@@ -333,13 +350,11 @@ export default Plugin.define({
         }
 
         // 2. Apply current vars, counting additions and value changes.
-        //    Skip invalid names (e.g. a phantom `export PATH` entry) and
-        //    script-valued vars (e.g. nix's `shellHook`) — they corrupt
-        //    subprocess environments instead of configuring them.
+        //    filterVars drops invalid names (e.g. a phantom `export PATH`
+        //    entry) and script-valued vars (e.g. nix's `shellHook`) — they
+        //    corrupt subprocess environments instead of configuring them.
         const nextApplied = new Set<string>()
-        for (const [key, value] of Object.entries(newVars)) {
-          if (value == null) continue
-          if (!VALID_NAME.test(key) || SCRIPT_VARS.has(key)) continue
+        for (const [key, value] of Object.entries(filterVars(newVars))) {
           const current = process.env[key]
           if (current === undefined) outcome.added++
           else if (current !== value) outcome.changed++
