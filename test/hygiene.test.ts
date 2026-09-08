@@ -5,7 +5,9 @@ import { join } from "node:path"
 import { afterEach, beforeEach, describe, it } from "node:test"
 
 import {
+  baselinePath,
   direnvCandidates,
+  exportBaseline,
   filterVars,
   nearestEnvrc,
   probeDirenv,
@@ -69,6 +71,51 @@ describe("stripPoison", () => {
   })
 })
 
+describe("exportBaseline", () => {
+  let snap: Map<string, string | undefined>
+  beforeEach(() => {
+    snap = snapshot()
+    process.env.HOME = "/home/tester"
+    process.env.USER = "tester"
+    process.env.PATH = "/usr/bin:/bin"
+    process.env.TERM = "dumb"
+    delete process.env.TMPDIR
+  })
+  afterEach(() => restore(snap))
+
+  it("is a fixed minimal set, independent of ambient devshell variables", () => {
+    process.env.API_URL = "https://api.example.com/v1"
+    process.env.NIX_CFLAGS_COMPILE = "-O2"
+    const baseline = exportBaseline()
+    assert.equal(baseline.HOME, "/home/tester")
+    assert.equal(baseline.PATH, baselinePath(), "PATH comes from baselinePath, not process.env")
+    assert.ok(!("API_URL" in baseline), "devshell vars must not leak into the baseline")
+    assert.ok(!("NIX_CFLAGS_COMPILE" in baseline))
+  })
+
+  it("omits unset keys instead of passing undefined values", () => {
+    const baseline = exportBaseline()
+    assert.ok(!("TMPDIR" in baseline))
+    for (const value of Object.values(baseline)) {
+      assert.ok(typeof value === "string", `undefined leaked: ${String(value)}`)
+    }
+  })
+
+  it("always carries a stable PATH, never derived from process.env.PATH or HOST_PATH", () => {
+    process.env.PATH = "/nix/store/aaa/bin:$PATH"
+    process.env.HOST_PATH = "/nix/store/host/bin"
+    const baseline = exportBaseline()
+    assert.ok(!baseline.PATH!.includes("$"), "PATH must never contain a literal $")
+    assert.ok(!baseline.PATH!.includes("/nix/store/host/bin"), "HOST_PATH must not feed back in")
+    assert.ok(baseline.PATH!.includes("/usr/bin"), "PATH must include system paths")
+    assert.equal(baseline.PATH, exportBaseline().PATH, "PATH must be deterministic")
+  })
+
+  it("is deterministic: same environment yields the same baseline", () => {
+    assert.deepEqual(exportBaseline(), exportBaseline())
+  })
+})
+
 describe("filterVars", () => {
   it("drops invalid env names such as the phantom `export PATH`", () => {
     const filtered = filterVars({
@@ -90,6 +137,15 @@ describe("filterVars", () => {
   it("drops null and undefined values (direnv unset signals)", () => {
     const filtered = filterVars({ GONE: null, ALSO_GONE: undefined, KEPT: "1" })
     assert.deepEqual(filtered, { KEPT: "1" })
+  })
+
+  it("drops direnv bookkeeping variables that churn per invocation", () => {
+    const filtered = filterVars({
+      DIRENV_DIFF: "eJx…hash-of-diff",
+      DIRENV_WATCHES: "eJw…watch-state",
+      API_URL: "https://api.example.com/v1",
+    })
+    assert.deepEqual(filtered, { API_URL: "https://api.example.com/v1" })
   })
 })
 

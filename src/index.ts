@@ -128,15 +128,38 @@ export const stripPoison = (): string[] => {
 }
 
 /**
+ * The environment `direnv export json` is invoked with.
+ *
+ * direnv computes its export as a *diff against the invoking environment*, so
+ * the invoking environment must be STABLE and independent of what this plugin
+ * previously applied:
+ *
+ * - Invoking direnv with vars we applied on an earlier reload makes direnv
+ *   omit them from the export; the plugin would read that as "dropped",
+ *   delete them, and the next export would re-add them — oscillating (`+N` /
+ *   `-N`) on every no-op reload.
+ * - Conversely, stripping applied vars from the real environment is wrong
+ *   too: removing `PATH` makes the devshell evaluate against an empty PATH,
+ *   exporting a PATH with no system/profile entries at all.
+ *
+ * So direnv always runs against this fixed, minimal baseline — the export
+ * becomes a pure function of the devshell itself, like a fresh login shell
+ * entering the project directory.
+ */
+/**
  * Filter a `direnv export json` payload down to variables that are safe to
- * apply: valid POSIX names only (drops phantom entries like `export PATH`)
- * and no script-valued vars (drops nix's `shellHook` and friends).
+ * apply: valid POSIX names only (drops phantom entries like `export PATH`),
+ * no script-valued vars (drops nix's `shellHook` and friends), and no direnv
+ * bookkeeping vars (`DIRENV_DIFF`, `DIRENV_WATCHES`, … churn on every
+ * evaluation and exist for the wrapping shell's eval, not for consumers —
+ * applying them makes reloads oscillate and pollutes spawned shells).
  */
 export const filterVars = (vars: Record<string, string | null | undefined>): Record<string, string> => {
   const safe: Record<string, string> = {}
   for (const [key, value] of Object.entries(vars)) {
     if (value == null) continue
     if (!VALID_NAME.test(key) || SCRIPT_VARS.has(key)) continue
+    if (key.startsWith("DIRENV_")) continue
     safe[key] = value
   }
   return safe
@@ -154,6 +177,67 @@ export const repairPath = (): string => {
   process.env.PATH = fallback
   console.warn(`direnv: repaired corrupted PATH (was ${JSON.stringify(current)})`)
   return fallback
+}
+
+/**
+ * The PATH used in the direnv baseline. Deliberately does NOT read
+ * process.env.PATH or HOST_PATH: the plugin applies the devshell PATH (and
+ * the devshell exports HOST_PATH) into process.env, so reading either back
+ * would feed the plugin's own output into the next baseline and oscillate.
+ * Built from stable per-machine locations only, so the export stays a pure
+ * function of the devshell. Custom interactive-shell PATH entries are not
+ * part of it by design; the devshell's own paths are prepended by the export.
+ */
+export const baselinePath = (): string => {
+  const parts: string[] = []
+  if (process.env.HOME) parts.push(`${process.env.HOME}/.nix-profile/bin`)
+  if (process.env.USER) parts.push(`/etc/profiles/per-user/${process.env.USER}/bin`)
+  parts.push(
+    "/nix/var/nix/profiles/default/bin",
+    "/run/current-system/sw/bin",
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+    "/usr/bin:/bin:/usr/sbin:/sbin",
+  )
+  return parts.join(":")
+}
+
+/**
+ * The environment `direnv export json` is invoked with.
+ *
+ * direnv computes its export as a *diff against the invoking environment*, so
+ * the invoking environment must be STABLE and independent of what this plugin
+ * previously applied:
+ *
+ * - Invoking direnv with vars we applied on an earlier reload makes direnv
+ *   omit them from the export; the plugin would read that as "dropped",
+ *   delete them, and the next export would re-add them — oscillating (`+N` /
+ *   `-N`) on every no-op reload.
+ * - Conversely, stripping applied vars from the real environment is wrong
+ *   too: removing `PATH` makes the devshell evaluate against an empty PATH,
+ *   exporting a PATH with no system/profile entries at all.
+ *
+ * So direnv always runs against this fixed, minimal baseline — the export
+ * becomes a pure function of the devshell itself, like a fresh login shell
+ * entering the project directory.
+ */
+export const exportBaseline = (): NodeJS.ProcessEnv => {
+  const wanted: Array<keyof NodeJS.ProcessEnv> = [
+    "HOME",
+    "USER",
+    "TERM",
+    "TMPDIR",
+    "SHELL",
+    "LANG",
+  ]
+  const baseline: NodeJS.ProcessEnv = {}
+  for (const key of wanted) {
+    const value = process.env[key]
+    if (value !== undefined) baseline[key] = value
+  }
+  // never derived from (possibly corrupted or plugin-applied) process.env.PATH
+  baseline.PATH = baselinePath()
+  return baseline
 }
 
 /**
@@ -212,11 +296,17 @@ const sanitize = (): boolean => {
   return stripped.length > 0 || process.env.PATH !== before
 }
 
-const runText = async (file: string, args: string[], cwd: string) => {
+const runText = async (
+  file: string,
+  args: string[],
+  cwd: string,
+  env?: NodeJS.ProcessEnv,
+) => {
   const { stdout } = await run(file, args, {
     cwd,
     encoding: "utf8",
     maxBuffer: 10 * 1024 * 1024,
+    ...(env ? { env } : {}),
   })
   return stdout
 }
@@ -326,7 +416,9 @@ export default Plugin.define({
 
         let jsonText: string
         try {
-          jsonText = await runText(direnv, ["export", "json"], dir)
+          // See exportBaseline: a fixed baseline keeps the direnv diff stable
+          // (no oscillation) and the exported PATH well-formed.
+          jsonText = await runText(direnv, ["export", "json"], dir, exportBaseline())
         } catch (error: unknown) {
           const stderr =
             error && typeof error === "object" && "stderr" in error
@@ -344,10 +436,15 @@ export default Plugin.define({
         const newVars: Record<string, string> =
           parsed && typeof parsed === "object" ? parsed : {}
 
-        // 1. Remove vars we previously applied that the devshell no longer exports.
-        //    direnv may also emit explicit `null` values to signal unsets.
+        const filteredVars = filterVars(newVars)
+
+        // 1. Remove vars we previously applied that the devshell no longer
+        //    exports (or that are no longer safe to apply). Checked against
+        //    the *filtered* set so previously-applied keys that filtering now
+        //    drops (e.g. direnv bookkeeping) are cleaned from process.env.
+        //    direnv's explicit `null` unset signals land here too.
         for (const key of appliedKeys) {
-          const keep = key in newVars && newVars[key] != null
+          const keep = key in filteredVars
           if (!keep && key in process.env) {
             delete process.env[key]
             outcome.removed++
@@ -359,7 +456,7 @@ export default Plugin.define({
         //    entry) and script-valued vars (e.g. nix's `shellHook`) — they
         //    corrupt subprocess environments instead of configuring them.
         const nextApplied = new Set<string>()
-        for (const [key, value] of Object.entries(filterVars(newVars))) {
+        for (const [key, value] of Object.entries(filteredVars)) {
           const current = process.env[key]
           if (current === undefined) outcome.added++
           else if (current !== value) outcome.changed++
@@ -369,7 +466,10 @@ export default Plugin.define({
 
         appliedKeys.clear()
         for (const key of nextApplied) appliedKeys.add(key)
-        currentVars = newVars
+        // Inject only the filtered set: the raw payload can carry null
+        // unset-signals, and the shell hook writes values verbatim into
+        // spawned shell environments (which must be strings).
+        currentVars = filterVars(newVars)
 
         return outcome
       } catch {
