@@ -72,7 +72,39 @@ direnv: .envrc is blocked. Run `direnv allow` to enable.
 
 ### Local development
 
-Local plugins load from a directory containing an `index.ts` entrypoint:
+To dogfood this repository's working tree instead of the published package
+(this repo's own setup), disable the published plugin and load a local dev
+instance with a **distinct plugin id**:
+
+```jsonc
+// opencode.json (project)
+{
+  "plugins": ["-opencode2-direnv"]
+}
+```
+
+```ts
+// .opencode/plugins/dev/index.ts — auto-discovered, not published
+const plugin = (await import(`../../../src/index.js?dev=${Date.now()}`)).default
+
+export default { ...plugin, id: "opencode2-direnv-dev" }
+```
+
+Three details matter:
+
+- **Distinct id** — without it the local instance's own `opencode2-direnv` id
+  re-enables the disabled package ("a later id re-enables a disabled plugin")
+  and then fails with `Duplicate plugin ID`.
+- **Cache-busted dynamic import** — OpenCode cache-busts only the entrypoint
+  file (`index.ts?mtime=…`); a static import of `src/index.js` is served from
+  the module cache for the server's lifetime, so `src/` edits would silently
+  run stale code until a service restart. The per-evaluation query makes every
+  wrapper reload import the current working tree.
+- **`.opencode/plugins/`** — configured path entries must be *directories* on
+  current betas; direct files load only from `.opencode/plugins/`.
+
+In other projects (without a globally installed copy), a plain directory entry
+also works and needs no disable or distinct id:
 
 ```json
 {
@@ -80,11 +112,13 @@ Local plugins load from a directory containing an `index.ts` entrypoint:
 }
 ```
 
-The root `index.ts` re-exports `src/index.ts`, so edits are picked up on restart. Typecheck and build with:
+The root `index.ts` re-exports `src/index.ts`; with the plain entry, edits are
+picked up on restart. Typecheck, test, and build with:
 
 ```bash
 npm ci
 npx tsc --noEmit
+npm test
 npm run build
 ```
 
