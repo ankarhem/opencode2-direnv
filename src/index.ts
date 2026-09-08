@@ -22,8 +22,10 @@ import { promisify } from "node:util"
  *   (e.g. after the user edits the flake in their own editor/terminal)
  * - Injects the latest direnv export into every spawned shell via the
  *   `shell.create.before` hook (primary mechanism)
- * - Reconciles process.env as a fallback for other subprocesses (LSP, MCP) and
- *   *removes* dropped keys so removed variables don't linger
+ * - Reconciles process.env as a fallback for other subprocesses (LSP, MCP),
+ *   *removing* dropped keys — with cross-instance ownership so parallel
+ *   projects can't delete each other's live vars, and fully released keys
+ *   revert to their pre-plugin values
  * - Logs outcomes with a `direnv:` prefix (blocked .envrc is always reported)
  * - Silently skips if direnv is not installed or .envrc is missing
  *
@@ -158,6 +160,9 @@ export const filterVars = (vars: Record<string, string | null | undefined>): Rec
   const safe: Record<string, string> = {}
   for (const [key, value] of Object.entries(vars)) {
     if (value == null) continue
+    // `__proto__` passes VALID_NAME but assignment would hit the prototype
+    // setter instead of creating an env entry — never safe to apply.
+    if (key === "__proto__") continue
     if (!VALID_NAME.test(key) || SCRIPT_VARS.has(key)) continue
     if (key.startsWith("DIRENV_")) continue
     safe[key] = value
@@ -282,6 +287,141 @@ export const nearestEnvrc = (start: string, stopAt: string | null): string | nul
 }
 
 /**
+ * Shared ownership of the global process.env across plugin instances.
+ *
+ * One server process can host several locations (projects), each with its own
+ * plugin instance and devshell, but process.env is global. If every instance
+ * tracked only its own keys, instance A dropping a key it no longer exports
+ * would delete it even while instance B still exports it — parallel sessions
+ * in different projects would flap (`-N` on A's reload, `+N` on B's).
+ *
+ * So every applied key records WHICH locations (owner directories) export it
+ * and the value each wants, plus the value predating the first claim. A key
+ * leaves process.env only when no instance owns it anymore, and then reverts
+ * to its pre-plugin value instead of vanishing. Conflicting values for one
+ * key across projects stay last-writer-wins (a single global env cannot hold
+ * both); the cwd-scoped shell hook remains the precise per-shell mechanism.
+ */
+export type SharedEnvState = {
+  /** key -> (owner directory -> wanted value); insertion-ordered, last wins */
+  owners: Map<string, Map<string, string>>
+  /** key -> value from before the first claim (undefined = was absent) */
+  originals: Map<string, string | undefined>
+}
+
+export const createSharedEnvState = (): SharedEnvState => ({
+  owners: new Map(),
+  originals: new Map(),
+})
+
+/** module singleton used by the live plugin instances in this process */
+const sharedEnv: SharedEnvState = createSharedEnvState()
+
+/** read that ignores inherited properties (`"toString" in env` is true) */
+const readEnvKey = (env: NodeJS.ProcessEnv, key: string): string | undefined =>
+  Object.hasOwn(env, key) ? env[key] : undefined
+
+const lastOwnerValue = (owned: Map<string, string> | undefined): string | undefined => {
+  if (!owned || owned.size === 0) return undefined
+  let last = ""
+  for (const value of owned.values()) last = value
+  return last
+}
+
+/**
+ * Drop one owner's claim on a key, repairing process.env to match whoever
+ * (if anyone) still owns it. Returns how the environment transitioned.
+ */
+const releaseOneKey = (
+  state: SharedEnvState,
+  env: NodeJS.ProcessEnv,
+  owner: string,
+  key: string,
+): "removed" | "changed" | "unchanged" => {
+  const owned = state.owners.get(key)
+  if (owned) {
+    owned.delete(owner)
+    if (owned.size === 0) state.owners.delete(key)
+  }
+  const survivor = lastOwnerValue(state.owners.get(key))
+  if (survivor === undefined) {
+    if (readEnvKey(env, key) !== undefined) {
+      const original = state.originals.get(key)
+      if (original === undefined) delete env[key]
+      else env[key] = original
+      state.originals.delete(key)
+      return "removed"
+    }
+    state.originals.delete(key)
+    return "unchanged"
+  }
+  if (readEnvKey(env, key) !== survivor) {
+    env[key] = survivor
+    return "changed"
+  }
+  return "unchanged"
+}
+
+/**
+ * Claim `filteredVars` for `owner` and reconcile `env`, honouring other
+ * owners' claims. Pure w.r.t. module state (all shared state is passed in)
+ * so parallel instances are testable without a server.
+ */
+export const reconcileSharedEnv = (
+  state: SharedEnvState,
+  env: NodeJS.ProcessEnv,
+  owner: string,
+  prevOwned: Set<string>,
+  filteredVars: Record<string, string>,
+): { added: number; changed: number; removed: number; nextOwned: Set<string> } => {
+  let added = 0
+  let changed = 0
+  let removed = 0
+
+  // 1. Release keys this owner no longer exports. Keys still owned elsewhere
+  //    survive (restoring the surviving owner's value); only fully unowned
+  //    keys revert to their pre-plugin values. `hasOwn` (not `in`) so
+  //    prototype-named keys can't leak by looking "kept".
+  for (const key of prevOwned) {
+    if (Object.hasOwn(filteredVars, key)) continue
+    const result = releaseOneKey(state, env, owner, key)
+    if (result === "removed") removed++
+    else if (result === "changed") changed++
+  }
+
+  // 2. Claim + apply current exports (conflicting values: last writer wins).
+  const nextOwned = new Set<string>()
+  for (const [key, value] of Object.entries(filteredVars)) {
+    let owned = state.owners.get(key)
+    if (!owned) {
+      owned = new Map()
+      state.owners.set(key, owned)
+      if (!state.originals.has(key)) state.originals.set(key, readEnvKey(env, key))
+    }
+    owned.delete(owner)
+    owned.set(owner, value)
+    const current = readEnvKey(env, key)
+    if (current === undefined) added++
+    else if (current !== value) changed++
+    env[key] = value
+    nextOwned.add(key)
+  }
+
+  return { added, changed, removed, nextOwned }
+}
+
+/** Release every key `owner` holds (plugin teardown); survivors keep theirs. */
+export const releaseAllSharedEnv = (
+  state: SharedEnvState,
+  env: NodeJS.ProcessEnv,
+  owner: string,
+  owned: Set<string>,
+): void => {
+  for (const key of owned) releaseOneKey(state, env, owner, key)
+  owned.clear()
+}
+
+/**
  * Strip poison and repair PATH. Runs before every direnv invocation so a
  * daemon that gets corrupted mid-flight heals itself on the next reload.
  * Returns true if anything was repaired.
@@ -324,9 +464,10 @@ export default Plugin.define({
     const loadedSessions = new Set<string>()
 
     /**
-     * Keys we have written into process.env. Tracked globally (process.env is
-     * shared across locations in the server process) so reloads can remove vars
-     * that the devshell no longer exports without touching anything we didn't set.
+     * Keys this instance has claimed in the shared process.env registry.
+     * process.env itself is global across locations in the server process —
+     * see SharedEnvState — so removal goes through shared ownership and never
+     * deletes a key another project still exports.
      */
     const appliedKeys = new Set<string>()
 
@@ -438,34 +579,22 @@ export default Plugin.define({
 
         const filteredVars = filterVars(newVars)
 
-        // 1. Remove vars we previously applied that the devshell no longer
-        //    exports (or that are no longer safe to apply). Checked against
-        //    the *filtered* set so previously-applied keys that filtering now
-        //    drops (e.g. direnv bookkeeping) are cleaned from process.env.
-        //    direnv's explicit `null` unset signals land here too.
-        for (const key of appliedKeys) {
-          const keep = key in filteredVars
-          if (!keep && key in process.env) {
-            delete process.env[key]
-            outcome.removed++
-          }
-        }
-
-        // 2. Apply current vars, counting additions and value changes.
+        // 1. Release vars this devshell no longer exports (or that are no
+        //    longer safe to apply). Shared ownership keeps keys alive while
+        //    another project still exports them; fully released keys revert
+        //    to their pre-plugin values. direnv's explicit `null` unset
+        //    signals land here too (filterVars already dropped them).
+        // 2. Claim + apply current vars, counting additions and value changes
+        //    (conflicting values across projects: last writer wins).
         //    filterVars drops invalid names (e.g. a phantom `export PATH`
         //    entry) and script-valued vars (e.g. nix's `shellHook`) — they
         //    corrupt subprocess environments instead of configuring them.
-        const nextApplied = new Set<string>()
-        for (const [key, value] of Object.entries(filteredVars)) {
-          const current = process.env[key]
-          if (current === undefined) outcome.added++
-          else if (current !== value) outcome.changed++
-          process.env[key] = value
-          nextApplied.add(key)
-        }
-
+        const counts = reconcileSharedEnv(sharedEnv, process.env, directory, appliedKeys, filteredVars)
+        outcome.added += counts.added
+        outcome.changed += counts.changed
+        outcome.removed += counts.removed
         appliedKeys.clear()
-        for (const key of nextApplied) appliedKeys.add(key)
+        for (const key of counts.nextOwned) appliedKeys.add(key)
         // Inject only the filtered set: the raw payload can carry null
         // unset-signals, and the shell hook writes values verbatim into
         // spawned shell environments (which must be strings).
@@ -645,6 +774,9 @@ export default Plugin.define({
     return () => {
       controller.abort()
       if (reloadTimer) clearTimeout(reloadTimer)
+      // Release our shared-env claims so parallel projects keep their values
+      // and fully released keys revert to pre-plugin values.
+      releaseAllSharedEnv(sharedEnv, process.env, directory, appliedKeys)
       void shellRegistration.dispose()
       void toolRegistration.dispose()
     }

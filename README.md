@@ -134,7 +134,7 @@ plugin setup ────▶ direnv export json ──▶ process.env reconcile
 
 1. **Discovery** — Searches upward from the plugin's location directory, stopping at the git root
 2. **Export** — Runs `direnv export json` (fast when nothing changed; direnv's own watch caches it)
-3. **Reconcile** — Applies additions/changes and *removes* dropped keys; explicit direnv unsets (`null` values) are honored
+3. **Reconcile** — Applies additions/changes and *removes* dropped keys; explicit direnv unsets (`null` values) are honored. Keys are reference-counted across parallel projects, so one project's reload can't delete another's live vars; fully released keys revert to their pre-plugin values
 4. **Inject** — The `shell.create.before` hook copies the cached export into the environment of every shell spawned below the devshell directory
 
 ## Troubleshooting
