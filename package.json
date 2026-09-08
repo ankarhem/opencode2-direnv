@@ -1,6 +1,6 @@
 {
   "name": "opencode2-direnv",
-  "version": "2026.0904.0",
+  "version": "2026.0908.0",
   "description": "OpenCode 2 plugin that automatically loads direnv environment variables",
   "type": "module",
   "main": "dist/index.js",
