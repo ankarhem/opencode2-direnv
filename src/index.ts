@@ -15,6 +15,11 @@ import { promisify } from "node:util"
  * - On plugin setup: load env once (awaited, so the first command is ready)
  * - On session.created: re-sync per new session (e.g. after `direnv allow`)
  * - On filesystem.changed for .envrc/flake.nix/flake.lock: debounced reload
+ *   (NOTE: as of server beta-19151 the server declares but never emits
+ *   filesystem.changed, so this trigger is dormant; use the direnv_reload
+ *   tool until an fs watcher or server-side emission exists)
+ * - Exposes a `direnv_reload` tool so the agent can force a re-sync manually
+ *   (e.g. after the user edits the flake in their own editor/terminal)
  * - Injects the latest direnv export into every spawned shell via the
  *   `shell.create.before` hook (primary mechanism)
  * - Reconciles process.env as a fallback for other subprocesses (LSP, MCP) and
@@ -424,6 +429,29 @@ export default Plugin.define({
     // Initial load: awaited so the first command of any session sees the env.
     logOutcome(await reloadEnv(), { initial: true })
 
+    /**
+     * Human/agent-readable one-liner for a reload outcome, used by the
+     * direnv_reload tool result.
+     */
+    const describeOutcome = (outcome: ReloadOutcome): string => {
+      if (outcome.blocked) {
+        return "direnv: .envrc is blocked. Run `direnv allow` and retry."
+      }
+      if (outcome.unavailable) {
+        return "direnv: unavailable (direnv not installed or no .envrc found)."
+      }
+      if (outcome.error) {
+        return "direnv: `direnv export json` failed; see server logs for details."
+      }
+      const parts: string[] = []
+      if (outcome.added) parts.push(`+${outcome.added}`)
+      if (outcome.changed) parts.push(`~${outcome.changed}`)
+      if (outcome.removed) parts.push(`-${outcome.removed}`)
+      return parts.length
+        ? `direnv: reloaded (${parts.join(" ")}); new shells use the updated environment.`
+        : "direnv: reloaded, nothing changed."
+    }
+
     // Primary mechanism: inject the latest direnv export into every shell the
     // server spawns for a working copy inside the devshell. The cached payload
     // keeps the hook synchronous and non-blocking.
@@ -433,6 +461,38 @@ export default Plugin.define({
       for (const [key, value] of Object.entries(currentVars)) {
         event.env[key] = value
       }
+    })
+
+    /**
+     * Agent-facing manual reload. The filesystem.changed event the background
+     * reload depends on is declared but not emitted by current OpenCode 2
+     * servers, so after the user edits .envrc/flake.nix in their own editor
+     * the environment would silently go stale. This tool lets the agent force
+     * a re-sync on demand (works regardless of server-side event support).
+     */
+    const toolRegistration = await ctx.tool.transform((editor) => {
+      editor.namespace({
+        name: "direnv",
+        description: "Devshell (direnv) environment tools",
+      })
+      editor.add({
+        name: "reload",
+        description:
+          "Re-export the direnv devshell and apply it to OpenCode, so subsequently spawned shells " +
+          "see the updated environment. Call this after .envrc, flake.nix, or flake.lock were changed " +
+          "outside OpenCode (user edited them mid-session), or when devshell-provided tools are missing " +
+          "from PATH / resolve to stale /nix/store paths.",
+        input: {
+          type: "object",
+          properties: {},
+          additionalProperties: false,
+        },
+        execute: async () => {
+          const outcome = await reloadEnv()
+          logOutcome(outcome, { initial: false })
+          return { content: describeOutcome(outcome) }
+        },
+      })
     })
 
     const isRelevantLocation = (location: EncodedEvent["location"]) =>
@@ -469,8 +529,13 @@ export default Plugin.define({
             }
           }
         }
-      } catch {
-        // stream aborted on cleanup or failed; nothing to do
+      } catch (error) {
+        // Abort is the normal cleanup path (controller aborted in teardown);
+        // anything else means we silently lost session.created/filesystem.changed
+        // triggers and the environment will go stale without anyone knowing.
+        if (controller.signal.aborted) return
+        const detail = error instanceof Error ? `${error.message}` : String(error)
+        console.warn(`direnv: event stream failed, devshell reload triggers are dead: ${detail}`)
       }
     })()
 
@@ -478,6 +543,7 @@ export default Plugin.define({
       controller.abort()
       if (reloadTimer) clearTimeout(reloadTimer)
       void shellRegistration.dispose()
+      void toolRegistration.dispose()
     }
   },
 })
