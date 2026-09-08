@@ -587,6 +587,9 @@ export default Plugin.define({
           properties: {},
           additionalProperties: false,
         },
+        // without this the tool registers as a top-level `reload` instead of
+        // joining the `direnv` namespace registered above
+        options: { namespace: "direnv" },
         execute: async () => {
           const outcome = await reloadEnv()
           logOutcome(outcome, { initial: false })
